@@ -61,6 +61,10 @@ export interface Terminal {
  * Real terminal using process.stdin/stdout
  */
 export class ProcessTerminal implements Terminal {
+	private static activeTerminals = new Set<ProcessTerminal>();
+	private static cleanupRegistered = false;
+	private static cleanupInProgress = false;
+
 	private wasRaw = false;
 	private inputHandler?: (data: string) => void;
 	private resizeHandler?: () => void;
@@ -89,6 +93,8 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	start(onInput: (data: string) => void, onResize: () => void): void {
+		ProcessTerminal.registerEmergencyCleanup();
+		ProcessTerminal.activeTerminals.add(this);
 		this.inputHandler = onInput;
 		this.resizeHandler = onResize;
 
@@ -273,19 +279,7 @@ export class ProcessTerminal implements Terminal {
 			process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
 		}
 
-		// Disable bracketed paste mode
-		process.stdout.write("\x1b[?2004l");
-
-		// Disable Kitty keyboard protocol if not already done by drainInput()
-		if (this._kittyProtocolActive) {
-			process.stdout.write("\x1b[<u");
-			this._kittyProtocolActive = false;
-			setKittyProtocolActive(false);
-		}
-		if (this._modifyOtherKeysActive) {
-			process.stdout.write("\x1b[>4;0m");
-			this._modifyOtherKeysActive = false;
-		}
+		this.writeTerminalResetSequences((data) => process.stdout.write(data));
 
 		// Clean up StdinBuffer
 		if (this.stdinBuffer) {
@@ -312,6 +306,68 @@ export class ProcessTerminal implements Terminal {
 		// Restore raw mode state
 		if (process.stdin.setRawMode) {
 			process.stdin.setRawMode(this.wasRaw);
+		}
+		ProcessTerminal.activeTerminals.delete(this);
+	}
+
+	private static registerEmergencyCleanup(): void {
+		if (ProcessTerminal.cleanupRegistered) return;
+		ProcessTerminal.cleanupRegistered = true;
+
+		const cleanup = () => ProcessTerminal.emergencyRestoreActiveTerminals();
+		process.on("exit", cleanup);
+		process.on("uncaughtExceptionMonitor", cleanup);
+	}
+
+	private static emergencyRestoreActiveTerminals(): void {
+		if (ProcessTerminal.cleanupInProgress) return;
+		ProcessTerminal.cleanupInProgress = true;
+		try {
+			for (const terminal of ProcessTerminal.activeTerminals) {
+				terminal.emergencyRestore();
+			}
+		} finally {
+			ProcessTerminal.activeTerminals.clear();
+			ProcessTerminal.cleanupInProgress = false;
+		}
+	}
+
+	private emergencyRestore(): void {
+		this.clearProgressInterval();
+		this.writeTerminalResetSequences((data) => {
+			try {
+				fs.writeSync(process.stdout.fd, data);
+			} catch {
+				// Ignore emergency cleanup errors.
+			}
+		});
+
+		try {
+			if (process.stdin.setRawMode) {
+				process.stdin.setRawMode(this.wasRaw);
+			}
+			process.stdin.pause();
+		} catch {
+			// Ignore emergency cleanup errors.
+		}
+	}
+
+	private writeTerminalResetSequences(write: (data: string) => void): void {
+		write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
+		// Disable bracketed paste mode.
+		write("\x1b[?2004l");
+		// Restore cursor visibility.
+		write("\x1b[?25h");
+
+		// Disable Kitty keyboard protocol if active.
+		if (this._kittyProtocolActive) {
+			write("\x1b[<u");
+			this._kittyProtocolActive = false;
+			setKittyProtocolActive(false);
+		}
+		if (this._modifyOtherKeysActive) {
+			write("\x1b[>4;0m");
+			this._modifyOtherKeysActive = false;
 		}
 	}
 
